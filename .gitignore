@@ -15,3 +15,24 @@ project/plugins/project/
 # Scala-IDE specific
 .scala_dependencies
 .worksheet
+*#
+*~
+target/
+/lib/
+logs/
+data/
+dist/
+etc/jetty/lib/
+etc/jetty/logs
+etc/solr/*/data/
+etc/solr/gilt*
+src/main/webapp/WEB-INF/lib/
+.idea
+*.ser
+*.iml
+*.iml
+*.ipr
+*.iws
+log/
+TAGS
+.DS_Store
