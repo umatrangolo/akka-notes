@@ -1,126 +1,103 @@
-import akka.actor.{ ActorRef, ActorSystem, Props, Actor, Inbox, Scheduler}
+import akka.actor.{ ActorRef, ActorSystem, Props, Actor, Inbox, Scheduler, FSM }
 import akka.util.Timeout
 import akka.pattern.ask
 import scala.concurrent.duration._
 import scala.concurrent.ExecutionContext.Implicits.global
+import scala.collection.LinearSeq
 
 case object Produce
 case object Consume
+
+// received events
 case object Get
 case class Put(v: Int)
-case class Success(v: Int)
+
+// sent events
 case object Full
 case object Empty
+case class Success(v: Int)
 case object WakeUp
 
-final class BoundedBuffer(capacity: Int) extends Actor {
+// states
+sealed trait State
+case object EmptyBuffer extends State
+case object FullBuffer extends State
+case object Available extends State
+
+sealed trait Data
+case class Buffer(count: Int, bb: LinearSeq[Int], waitingProducers: LinearSeq[ActorRef], waitingConsumers: LinearSeq[ActorRef]) extends Data
+case object NoData extends Data
+
+final class BoundedBuffer(val capacity: Int) extends Actor with FSM[State, Data] {
   import Utils._
-  import context._
 
   implicit val color = Console.GREEN
   private val who = s"Buffer($capacity)"
 
   say(who, s"Starting Bounded Buffer with capacity: $capacity")
 
-  private var count = 0
-  private val maxCapacity = capacity
-  private val buffer = new Array[Int](capacity)
+  startWith(EmptyBuffer, Buffer(0, LinearSeq.empty[Int], LinearSeq.empty[ActorRef], LinearSeq.empty[ActorRef]))
 
-  private val waitingProducers = scala.collection.mutable.ListBuffer.empty[ActorRef]
-  private val waitingConsumers = scala.collection.mutable.ListBuffer.empty[ActorRef]
+  initialize()
 
-  def available: Receive = {
-    case Get => {
-      val value = fetch()
-      say(who, s"Fetched value: $value, count: $count")
-      if (amIEmpty) {
-        say(who, "Switching to EMPTY state")
-        become(empty)
-      }
-      sender ! Success(value)
-    }
-    case Put(v) => {
-      store(v)
-      say(who, s"Stored value: $v, count: $count")
-      if (amIFull) {
-        say(who, "Switching to FULL state")
-        become(full)
-      }
-      sender ! Success(v)
-    }
-    case msg => say(who, s"Incorrect message for my status (AVAILABLE): $msg", true)
+  onTransition {
+    case EmptyBuffer -> Available => say(who, "EMPTY -> AVAILABLE")
+    case Available -> EmptyBuffer => say(who, "AVAILABLE -> EMPTY")
+    case Available -> FullBuffer => say(who, "AVAILABLE -> FULL")
+    case FullBuffer -> Available => say(who, "FULL -> AVAILABLE")
   }
 
-  def full: Receive = {
-    case Put(v) => {
-      say(who, s"Full buffer for value: $v, count: $count")
-      waitingProducers += sender
-      sender ! Full
-    }
-    case Get => {
-      val value = fetch()
-      say(who, s"Fetched value: $value, count: $count")
-      awakeProducers()
-      become(available)
-      sender ! Success(value)
-    }
-    case msg => say(who, s"Incorrect message for my status (FULL): $msg", true)
-  }
-
-  def empty: Receive = {
-    case Get => {
-      say(who, s"Empty buffer, count: $count")
-      waitingConsumers += sender
-      sender ! Empty
-    }
-    case Put(v) => {
-      store(v)
-      say(who, s"Stored value: $v, count: $count")
-      awakeConsumers()
-      become(available)
-      sender ! Success(v)
-    }
-    case msg => say(who, s"Incorrect message for my status (EMPTY): $msg", true)
-  }
-
-  override def receive = empty   // initially the buffer is empty
-
-  private def store(v: Int) {
-    buffer(count) = v
-    count = count + 1
-  }
-
-  private def fetch(): Int = {
-    count = count - 1
-    val v = buffer(count)
-    v
-  }
-
-  private def awakeProducers() {
-    if (!waitingProducers.isEmpty) {
-      val toWakeUp = waitingProducers.clone
-      waitingProducers.clear
-      toWakeUp.foreach { p =>
-        say(who, s"Awaking producer: $p")
-        p ! WakeUp
-      }
+  when(EmptyBuffer) {
+    case Event(Get, buffer: Buffer) => stay using buffer.copy(waitingConsumers = sender +: buffer.waitingConsumers) replying (Empty)
+    case Event(Put(v), buffer: Buffer) => {
+      awakeConsumers(buffer.waitingConsumers)
+      goto(Available) using buffer.copy(1, LinearSeq(v), waitingConsumers = LinearSeq.empty[ActorRef]) replying (Success(v))
     }
   }
 
-  private def awakeConsumers() {
-    if (!waitingConsumers.isEmpty) {
-      val toWakeUp = waitingConsumers.clone
-      waitingConsumers.clear
-      toWakeUp.foreach { c =>
-        say(who, s"Awaking consumer: $c")
-        c ! WakeUp
-      }
+  when(FullBuffer) {
+    case Event(Put(v), buffer: Buffer) => stay using buffer.copy(waitingProducers = sender +: buffer.waitingProducers) replying (Full)
+    case Event(Get, buffer: Buffer) => {
+      val v = buffer.bb.head
+      awakeProducers(buffer.waitingProducers)
+      goto(Available) using buffer.copy(capacity - 1, buffer.bb.tail, waitingProducers = LinearSeq.empty[ActorRef]) replying (Success(v))
     }
   }
 
-  private def amIFull() = count == maxCapacity
-  private def amIEmpty() = count == 0
-  private def amIAvailable() = !amIFull() && !amIEmpty()
+  when(Available) {
+    case Event(Put(v), buffer: Buffer) if (buffer.count + 1 == capacity) =>
+      goto(FullBuffer) using buffer.copy(count = capacity, bb = v +: buffer.bb) replying (Success(v))
+    case Event(Put(v), buffer: Buffer) => stay using buffer.copy(count = buffer.count + 1, bb = v +: buffer.bb) replying (Success(v))
+    case Event(Get, buffer: Buffer) if (buffer.count - 1 == 0) => {
+      val v = buffer.bb.head
+      goto(EmptyBuffer) using buffer.copy(count = 0, bb = LinearSeq.empty[Int]) replying (Success(v))
+    }
+    case Event(Get, buffer: Buffer) => {
+      val v = buffer.bb.head
+      stay using buffer.copy(count = buffer.count - 1, bb = buffer.bb.tail) replying (Success(v))
+    }
+  }
+
+  whenUnhandled {
+    case Event(msg, data) => {
+      say(who, s"Received unhandled event in my current state. msg: $msg, data: $data", true)
+      stay
+    }
+  }
+
+  def awakeProducers(producers: LinearSeq[ActorRef]) {
+    producers.foreach { p =>
+      say(who, s"Awaking producer: $p")
+      p ! WakeUp
+    }
+  }
+
+  def awakeConsumers(consumers: LinearSeq[ActorRef]) {
+    consumers.foreach { c =>
+      say(who, s"Awaking consumer: $c")
+      c ! WakeUp
+    }
+  }
 }
 
 final class ProducerSupervisor extends Actor {
@@ -143,58 +120,66 @@ final class ProducerSupervisor extends Actor {
   }
 }
 
-class Producer(id: Int, buffer: ActorRef, scheduler: Scheduler) extends Actor {
+// state
+case object Producing extends State
+case object Waiting extends State
+case object Sleeping extends State
+
+case class Value(v: Int) extends Data
+
+class Producer(id: Int, buffer: ActorRef, scheduler: Scheduler) extends Actor with FSM[State, Data] {
   import Utils._
-  import context._
 
   implicit val color = Console.RED
   private val who = s"Producer-$id"
 
   say(who, s"Starting Producer with id: $id, buffer is $buffer")
 
+  startWith(Producing, Value(produce()))
+
+  initialize()
+
   override def postRestart(reason: Throwable) = {
+    initialize()
     self ! Produce
   }
 
-  def producing: Receive = {
-    case Produce => {
-      dieEventually()
-      val value = produce()
-      say(who, s"Trying to produce value: $value ...")
-      become(waiting)
-      buffer ! Put(value)
+  when(Producing) {
+    case Event(Produce, Value(v)) => {
+      buffer ! Put(v)
+      goto(Waiting) using Value(v)
     }
-    case msg => say(who, s"Incorrect message for my status (PRODUCING): $msg", true)
   }
 
-  def waiting: Receive = {
-    case Success(v) => {
-      dieEventually()
-      say(who, s"Successfully produced value: $v")
-      become(producing)
-      scheduler.scheduleOnce(scala.math.abs(scala.util.Random.nextInt(500)) milliseconds) {
-        self ! Produce
-      }(scala.concurrent.ExecutionContext.Implicits.global)
+  when(Waiting) {
+    case Event(Success(v1), Value(v2)) => {
+      require(v1 == v2)
+      goto(Producing) using Value(produce())
     }
-    case Full => {
-      dieEventually()
-      say(who, "Got a Full from the Buffer. Going to sleep...")
-      become(sleeping)
-    }
-    case msg => say(who, s"Incorrect message for my status (WAITING): $msg", true)
+    case Event(Full, Value(v)) => goto(Sleeping) using Value(v)
   }
 
-  def sleeping: Receive = {
-    case WakeUp => {
-      dieEventually()
-      say(who, "Got a WakeUp from Buffer. Trying to produce ...")
-      become(producing)
-      self ! Produce
-    }
-    case msg => say(who, s"Incorrect message for my status (SLEEPING): $msg", true)
+  when (Sleeping) {
+    case Event(WakeUp, Value(v)) => goto(Waiting) using Value(v) replying(Put(v))
   }
 
-  override def receive = producing
+  whenUnhandled {
+    case Event(msg, data) => {
+      say(who, s"Received unhandled event in my current state. msg: $msg, data: $data", true)
+      stay
+    }
+  }
+
+  onTransition {
+    case Producing -> Waiting => { say(who, "PRODUCING -> WAITING"); dieEventually() }
+    case Waiting -> Sleeping => { say(who, "WAITING -> SLEEPING"); dieEventually() }
+    case Sleeping -> Waiting => { say(who, "SLEEPING -> WAITING"); dieEventually() }
+    case Waiting -> Producing => {
+      say(who, "WAITING -> PRODUCING")
+      setTimer("producing", Produce, Duration(scala.math.abs(scala.util.Random.nextInt(1000)), "milliseconds"), false)
+      dieEventually()
+    }
+  }
 
   private def produce(): Int = scala.math.abs(scala.util.Random.nextInt(1000))
 }
@@ -219,56 +204,61 @@ final class ConsumerSupervisor extends Actor {
   }
 }
 
-final class Consumer(id: Int, buffer: ActorRef, scheduler: Scheduler) extends Actor {
+// state
+case object Consuming extends State
+
+final class Consumer(id: Int, buffer: ActorRef, scheduler: Scheduler) extends Actor with FSM[State, Data] {
   import Utils._
-  import context._
 
   implicit val color = Console.YELLOW
   private val who = s"Consumer-$id"
   say(who, s"Starting Consumer with id: $id, buffer is $buffer")
 
+  startWith(Consuming, NoData)
+
+  initialize()
+
   override def postRestart(reason: Throwable) = {
+    initialize()
     self ! Consume
   }
 
-  def consuming: Receive = {
-    case Consume => {
-      dieEventually()
-      say(who, "Trying to consume ...")
+  when(Consuming) {
+    case Event(Consume, NoData) => {
       buffer ! Get
-      become(waiting)
+      goto(Waiting)
     }
-    case msg => say(who, s"Incorrect message for my status (CONSUMING): $msg", true)
   }
 
-  def waiting: Receive = {
-    case Success(v) => {
-      dieEventually()
-      say(who, s"Successfully consumed value: $v")
-      become(consuming)
-      scheduler.scheduleOnce(scala.math.abs(scala.util.Random.nextInt(500)) milliseconds) {
-        self ! Consume
-      }(scala.concurrent.ExecutionContext.Implicits.global)
-    }
-    case Empty => {
-      dieEventually()
-      say(who, "Buffer is empty. Going to sleep ...")
-      become(sleeping)
-    }
-    case msg => say(who, s"Incorrect message for my status (WAITING): $msg", true)
+  when(Waiting) {
+    case Event(Success(v), NoData) => goto(Consuming)
+    case Event(Empty, NoData) => goto(Sleeping)
   }
 
-  def sleeping: Receive = {
-    case WakeUp => {
-      dieEventually()
-      say(who, "Got a WakeUp from Buffer. Trying to consume ...")
-      become(consuming)
-      self ! Consume
+  when(Sleeping) {
+    case Event(WakeUp, NoData) => {
+      buffer ! Get
+      goto(Waiting)
     }
-    case msg => say(who, s"Incorrect message for my status (SLEEPING): $msg", true)
   }
 
-  override def receive = consuming
+  whenUnhandled {
+    case Event(msg, data) => {
+      say(who, s"Received unhandled event in my current state. msg: $msg, data: $data", true)
+      stay
+    }
+  }
+
+  onTransition {
+    case Consuming -> Waiting => { say(who, "CONSUMING -> WAITING"); dieEventually() }
+    case Waiting -> Consuming => {
+      setTimer("consuming", Consume, Duration(scala.math.abs(scala.util.Random.nextInt(1000)), "milliseconds"), false)
+      say(who, "WAITING -> CONSUMING")
+      dieEventually()
+    }
+    case Waiting -> Sleeping => { say(who, "WAITING -> SLEEPING"); dieEventually() }
+    case Sleeping -> Waiting => { say(who, "SLEEPING -> WAITING"); dieEventually() }
+  }
 }
 
 object Utils {
@@ -284,7 +274,7 @@ object Utils {
 object BB extends App {
   val producers = 1
   val consumers = 1
-  val capacity = 2
+  val capacity = 10
   println(s"Starting Bounded Buffer (producers: $producers, consumers: $consumers, capacity: $capacity)")
 
   val system = ActorSystem("bounded-buffer") // Create the 'bounded-buffer' system
