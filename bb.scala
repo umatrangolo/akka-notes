@@ -1,4 +1,6 @@
-import akka.actor.{ ActorRef, ActorSystem, Props, Actor, Inbox, Scheduler }
+import akka.actor.{ ActorRef, ActorSystem, Props, Actor, Inbox, Scheduler}
+import akka.util.Timeout
+import akka.pattern.ask
 import scala.concurrent.duration._
 import scala.concurrent.ExecutionContext.Implicits.global
 
@@ -121,7 +123,27 @@ final class BoundedBuffer(capacity: Int) extends Actor {
   private def amIAvailable() = !amIFull() && !amIEmpty()
 }
 
-final class Producer(id: Int, buffer: ActorRef, scheduler: Scheduler) extends Actor {
+final class ProducerSupervisor extends Actor {
+  import Utils._
+  import akka.actor.OneForOneStrategy
+  import akka.actor.SupervisorStrategy._
+  import scala.concurrent.duration._
+
+  implicit val color = Console.BLACK
+  private val who = s"ProducerSupervisor"
+
+  override val supervisorStrategy =
+    OneForOneStrategy(maxNrOfRetries = -1, withinTimeRange = Duration.Inf) {
+      case _: Exception                => Restart
+    }
+
+  override def receive = {
+    case p: Props => sender ! context.actorOf(p)
+    case msg => say(who, s"Unrecognized message. $msg", true)
+  }
+}
+
+class Producer(id: Int, buffer: ActorRef, scheduler: Scheduler) extends Actor {
   import Utils._
   import context._
 
@@ -130,8 +152,13 @@ final class Producer(id: Int, buffer: ActorRef, scheduler: Scheduler) extends Ac
 
   say(who, s"Starting Producer with id: $id, buffer is $buffer")
 
+  override def postRestart(reason: Throwable) = {
+    self ! Produce
+  }
+
   def producing: Receive = {
     case Produce => {
+      dieEventually()
       val value = produce()
       say(who, s"Trying to produce value: $value ...")
       become(waiting)
@@ -142,6 +169,7 @@ final class Producer(id: Int, buffer: ActorRef, scheduler: Scheduler) extends Ac
 
   def waiting: Receive = {
     case Success(v) => {
+      dieEventually()
       say(who, s"Successfully produced value: $v")
       become(producing)
       scheduler.scheduleOnce(scala.math.abs(scala.util.Random.nextInt(500)) milliseconds) {
@@ -149,6 +177,7 @@ final class Producer(id: Int, buffer: ActorRef, scheduler: Scheduler) extends Ac
       }(scala.concurrent.ExecutionContext.Implicits.global)
     }
     case Full => {
+      dieEventually()
       say(who, "Got a Full from the Buffer. Going to sleep...")
       become(sleeping)
     }
@@ -157,6 +186,7 @@ final class Producer(id: Int, buffer: ActorRef, scheduler: Scheduler) extends Ac
 
   def sleeping: Receive = {
     case WakeUp => {
+      dieEventually()
       say(who, "Got a WakeUp from Buffer. Trying to produce ...")
       become(producing)
       self ! Produce
@@ -169,6 +199,26 @@ final class Producer(id: Int, buffer: ActorRef, scheduler: Scheduler) extends Ac
   private def produce(): Int = scala.math.abs(scala.util.Random.nextInt(1000))
 }
 
+final class ConsumerSupervisor extends Actor {
+  import Utils._
+  import akka.actor.OneForOneStrategy
+  import akka.actor.SupervisorStrategy._
+  import scala.concurrent.duration._
+
+  implicit val color = Console.BLACK
+  private val who = s"ConsumerSupervisor"
+
+  override val supervisorStrategy =
+    OneForOneStrategy(maxNrOfRetries = -1, withinTimeRange = Duration.Inf) {
+      case _: Exception                => Restart
+    }
+
+  override def receive = {
+    case c: Props => sender ! context.actorOf(c)
+    case msg => say(who, s"Unrecognized message. $msg", true)
+  }
+}
+
 final class Consumer(id: Int, buffer: ActorRef, scheduler: Scheduler) extends Actor {
   import Utils._
   import context._
@@ -177,8 +227,13 @@ final class Consumer(id: Int, buffer: ActorRef, scheduler: Scheduler) extends Ac
   private val who = s"Consumer-$id"
   say(who, s"Starting Consumer with id: $id, buffer is $buffer")
 
+  override def postRestart(reason: Throwable) = {
+    self ! Consume
+  }
+
   def consuming: Receive = {
     case Consume => {
+      dieEventually()
       say(who, "Trying to consume ...")
       buffer ! Get
       become(waiting)
@@ -188,6 +243,7 @@ final class Consumer(id: Int, buffer: ActorRef, scheduler: Scheduler) extends Ac
 
   def waiting: Receive = {
     case Success(v) => {
+      dieEventually()
       say(who, s"Successfully consumed value: $v")
       become(consuming)
       scheduler.scheduleOnce(scala.math.abs(scala.util.Random.nextInt(500)) milliseconds) {
@@ -195,6 +251,7 @@ final class Consumer(id: Int, buffer: ActorRef, scheduler: Scheduler) extends Ac
       }(scala.concurrent.ExecutionContext.Implicits.global)
     }
     case Empty => {
+      dieEventually()
       say(who, "Buffer is empty. Going to sleep ...")
       become(sleeping)
     }
@@ -203,6 +260,7 @@ final class Consumer(id: Int, buffer: ActorRef, scheduler: Scheduler) extends Ac
 
   def sleeping: Receive = {
     case WakeUp => {
+      dieEventually()
       say(who, "Got a WakeUp from Buffer. Trying to consume ...")
       become(consuming)
       self ! Consume
@@ -217,26 +275,33 @@ object Utils {
   def say(who: String, msg: String, error: Boolean = false)(implicit color: String) {
     println(color + new java.util.Date + " " + who + { if (error) " [ERROR]" } + s" $msg")
   }
+
+  def dieEventually() {
+    if (scala.math.abs(scala.util.Random.nextInt(100)) <= 10) throw new NullPointerException("Ouch!")
+  }
 }
 
 object BB extends App {
-  val producers = 10
-  val consumers = 12
-  val capacity = 8
+  val producers = 1
+  val consumers = 1
+  val capacity = 2
   println(s"Starting Bounded Buffer (producers: $producers, consumers: $consumers, capacity: $capacity)")
 
   val system = ActorSystem("bounded-buffer") // Create the 'bounded-buffer' system
   val scheduler = system.scheduler
-  val inbox = Inbox.create(system) // Create an "actor-in-a-box"
+  implicit val inbox = Inbox.create(system) // Create an "actor-in-a-box"
 
   val boundedBuffer = system.actorOf(Props(classOf[BoundedBuffer], capacity), "bounded-buffer") // Create the 'bounded-buffer' actor
+  val producerSupervisor = system.actorOf(Props[ProducerSupervisor], "producer-supervisor")
+  val consumerSupervisor = system.actorOf(Props[ConsumerSupervisor], "consumer-supervisor")
+
+  implicit val timeout = Timeout(5 seconds)
 
   for (i <- 1 to producers) {
-    val p = system.actorOf(Props(classOf[Producer], i, boundedBuffer, scheduler), "producer-" + i)
-    inbox.send(p, Produce)
+    ask(producerSupervisor, Props(classOf[Producer], i, boundedBuffer, scheduler)).mapTo[ActorRef].map { _ ! Produce }
   }
-  for (i <- 1 to consumers) {
-    val c = system.actorOf(Props(classOf[Consumer], i, boundedBuffer, scheduler), "consumer-" + i)
-    inbox.send(c, Consume)
+
+  for (i <- 1 to producers) {
+    ask(consumerSupervisor, Props(classOf[Consumer], i, boundedBuffer, scheduler)).mapTo[ActorRef].map { _ ! Consume }
   }
 }
