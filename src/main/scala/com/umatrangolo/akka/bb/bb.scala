@@ -1,9 +1,14 @@
+package com.umatrangolo.akka.bb
+
 import akka.actor.{ ActorRef, ActorSystem, Props, Actor, Inbox, Scheduler, FSM }
-import akka.util.Timeout
 import akka.pattern.ask
-import scala.concurrent.duration._
-import scala.concurrent.ExecutionContext.Implicits.global
+import akka.util.Timeout
+import akka.event.Logging
+
 import scala.collection.LinearSeq
+import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent.duration._
+import com.typesafe.config._
 
 case object Produce
 case object Consume
@@ -34,17 +39,19 @@ final class BoundedBuffer(val capacity: Int) extends Actor with FSM[State, Data]
   implicit val color = Console.GREEN
   private val who = s"Buffer($capacity)"
 
-  say(who, s"Starting Bounded Buffer with capacity: $capacity")
+  val logger = Logging(context.system, this)
+
+  logger.info(s"Starting Bounded Buffer with capacity: $capacity")
 
   startWith(EmptyBuffer, Buffer(0, LinearSeq.empty[Int], LinearSeq.empty[ActorRef], LinearSeq.empty[ActorRef]))
 
   initialize()
 
   onTransition {
-    case EmptyBuffer -> Available => say(who, "EMPTY -> AVAILABLE")
-    case Available -> EmptyBuffer => say(who, "AVAILABLE -> EMPTY")
-    case Available -> FullBuffer => say(who, "AVAILABLE -> FULL")
-    case FullBuffer -> Available => say(who, "FULL -> AVAILABLE")
+    case EmptyBuffer -> Available => logger.info("EMPTY -> AVAILABLE")
+    case Available -> EmptyBuffer => logger.info("AVAILABLE -> EMPTY")
+    case Available -> FullBuffer => logger.info("AVAILABLE -> FULL")
+    case FullBuffer -> Available => logger.info("FULL -> AVAILABLE")
   }
 
   when(EmptyBuffer) {
@@ -80,21 +87,21 @@ final class BoundedBuffer(val capacity: Int) extends Actor with FSM[State, Data]
 
   whenUnhandled {
     case Event(msg, data) => {
-      say(who, s"Received unhandled event in my current state. msg: $msg, data: $data", true)
+      logger.info(s"Received unhandled event in my current state. msg: $msg, data: $data", true)
       stay
     }
   }
 
   def awakeProducers(producers: LinearSeq[ActorRef]) {
     producers.foreach { p =>
-      say(who, s"Awaking producer: $p")
+      logger.info(s"Awaking producer: $p")
       p ! WakeUp
     }
   }
 
   def awakeConsumers(consumers: LinearSeq[ActorRef]) {
     consumers.foreach { c =>
-      say(who, s"Awaking consumer: $c")
+      logger.info(s"Awaking consumer: $c")
       c ! WakeUp
     }
   }
@@ -109,6 +116,8 @@ final class ProducerSupervisor extends Actor {
   implicit val color = Console.BLACK
   private val who = s"ProducerSupervisor"
 
+  val logger = Logging(context.system, this)
+
   override val supervisorStrategy =
     OneForOneStrategy(maxNrOfRetries = -1, withinTimeRange = Duration.Inf) {
       case _: Exception                => Restart
@@ -116,7 +125,7 @@ final class ProducerSupervisor extends Actor {
 
   override def receive = {
     case p: Props => sender ! context.actorOf(p)
-    case msg => say(who, s"Unrecognized message. $msg", true)
+    case msg => logger.info(s"Unrecognized message. $msg", true)
   }
 }
 
@@ -133,7 +142,9 @@ class Producer(id: Int, buffer: ActorRef, scheduler: Scheduler) extends Actor wi
   implicit val color = Console.RED
   private val who = s"Producer-$id"
 
-  say(who, s"Starting Producer with id: $id, buffer is $buffer")
+  val logger = Logging(context.system, this)
+
+  logger.info(s"Starting Producer with id: $id, buffer is $buffer")
 
   startWith(Producing, Value(produce()))
 
@@ -165,17 +176,17 @@ class Producer(id: Int, buffer: ActorRef, scheduler: Scheduler) extends Actor wi
 
   whenUnhandled {
     case Event(msg, data) => {
-      say(who, s"Received unhandled event in my current state. msg: $msg, data: $data", true)
+      logger.info(s"Received unhandled event in my current state. msg: $msg, data: $data", true)
       stay
     }
   }
 
   onTransition {
-    case Producing -> Waiting => { say(who, "PRODUCING -> WAITING"); dieEventually() }
-    case Waiting -> Sleeping => { say(who, "WAITING -> SLEEPING"); dieEventually() }
-    case Sleeping -> Waiting => { say(who, "SLEEPING -> WAITING"); dieEventually() }
+    case Producing -> Waiting => { logger.info("PRODUCING -> WAITING"); dieEventually() }
+    case Waiting -> Sleeping => { logger.info("WAITING -> SLEEPING"); dieEventually() }
+    case Sleeping -> Waiting => { logger.info("SLEEPING -> WAITING"); dieEventually() }
     case Waiting -> Producing => {
-      say(who, "WAITING -> PRODUCING")
+      logger.info("WAITING -> PRODUCING")
       setTimer("producing", Produce, Duration(scala.math.abs(scala.util.Random.nextInt(1000)), "milliseconds"), false)
       dieEventually()
     }
@@ -193,6 +204,8 @@ final class ConsumerSupervisor extends Actor {
   implicit val color = Console.BLACK
   private val who = s"ConsumerSupervisor"
 
+  val logger = Logging(context.system, this)
+
   override val supervisorStrategy =
     OneForOneStrategy(maxNrOfRetries = -1, withinTimeRange = Duration.Inf) {
       case _: Exception                => Restart
@@ -200,7 +213,7 @@ final class ConsumerSupervisor extends Actor {
 
   override def receive = {
     case c: Props => sender ! context.actorOf(c)
-    case msg => say(who, s"Unrecognized message. $msg", true)
+    case msg => logger.info(s"Unrecognized message. $msg", true)
   }
 }
 
@@ -212,7 +225,10 @@ final class Consumer(id: Int, buffer: ActorRef, scheduler: Scheduler) extends Ac
 
   implicit val color = Console.YELLOW
   private val who = s"Consumer-$id"
-  say(who, s"Starting Consumer with id: $id, buffer is $buffer")
+
+  val logger = Logging(context.system, this)
+
+  logger.info(s"Starting Consumer with id: $id, buffer is $buffer")
 
   startWith(Consuming, NoData)
 
@@ -244,38 +260,36 @@ final class Consumer(id: Int, buffer: ActorRef, scheduler: Scheduler) extends Ac
 
   whenUnhandled {
     case Event(msg, data) => {
-      say(who, s"Received unhandled event in my current state. msg: $msg, data: $data", true)
+      logger.info(s"Received unhandled event in my current state. msg: $msg, data: $data", true)
       stay
     }
   }
 
   onTransition {
-    case Consuming -> Waiting => { say(who, "CONSUMING -> WAITING"); dieEventually() }
+    case Consuming -> Waiting => { logger.info("CONSUMING -> WAITING"); dieEventually() }
     case Waiting -> Consuming => {
       setTimer("consuming", Consume, Duration(scala.math.abs(scala.util.Random.nextInt(1000)), "milliseconds"), false)
-      say(who, "WAITING -> CONSUMING")
+      logger.info("WAITING -> CONSUMING")
       dieEventually()
     }
-    case Waiting -> Sleeping => { say(who, "WAITING -> SLEEPING"); dieEventually() }
-    case Sleeping -> Waiting => { say(who, "SLEEPING -> WAITING"); dieEventually() }
+    case Waiting -> Sleeping => { logger.info("WAITING -> SLEEPING"); dieEventually() }
+    case Sleeping -> Waiting => { logger.info("SLEEPING -> WAITING"); dieEventually() }
   }
 }
 
 object Utils {
-  def say(who: String, msg: String, error: Boolean = false)(implicit color: String) {
-    println(color + new java.util.Date + " " + who + { if (error) " [ERROR]" } + s" $msg")
-  }
-
   def dieEventually() {
     if (scala.math.abs(scala.util.Random.nextInt(100)) <= 10) throw new NullPointerException("Ouch!")
   }
 }
 
 object BB extends App {
-  val producers = 1
-  val consumers = 1
-  val capacity = 10
+  val producers = 10
+  val consumers = 5
+  val capacity = 5
   println(s"Starting Bounded Buffer (producers: $producers, consumers: $consumers, capacity: $capacity)")
+
+  val config = ConfigFactory.load()
 
   val system = ActorSystem("bounded-buffer") // Create the 'bounded-buffer' system
   val scheduler = system.scheduler
@@ -291,7 +305,7 @@ object BB extends App {
     ask(producerSupervisor, Props(classOf[Producer], i, boundedBuffer, scheduler)).mapTo[ActorRef].map { _ ! Produce }
   }
 
-  for (i <- 1 to producers) {
+  for (i <- 1 to consumers) {
     ask(consumerSupervisor, Props(classOf[Consumer], i, boundedBuffer, scheduler)).mapTo[ActorRef].map { _ ! Consume }
   }
 }
