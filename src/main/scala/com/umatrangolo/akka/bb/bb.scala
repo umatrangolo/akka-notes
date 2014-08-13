@@ -1,6 +1,6 @@
 package com.umatrangolo.akka.bb
 
-import akka.actor.{ ActorRef, ActorSystem, Props, Actor, Inbox, Scheduler, FSM, ActorLogging, LoggingFSM }
+import akka.actor.{ ActorRef, ActorSystem, Props, Actor, Inbox, Scheduler, FSM, ActorLogging, LoggingFSM, PoisonPill }
 import akka.event.Logging
 import akka.pattern.ask
 import akka.util.Timeout
@@ -291,7 +291,6 @@ object BB extends App {
   val system = ActorSystem("bounded-buffer") // Create the 'bounded-buffer' system
   val scheduler = system.scheduler
   println(system.dispatchers.lookup("akka.actor.pinned-dispatcher"))
-  implicit val inbox = Inbox.create(system) // Create an "actor-in-a-box"
 
   val boundedBuffer = system.actorOf(Props(classOf[BoundedBuffer], capacity), "bounded-buffer")
   val producerSupervisor = system.actorOf(Props[ProducerSupervisor], "producer-supervisor")
@@ -306,4 +305,16 @@ object BB extends App {
   for (i <- 1 to consumers) {
     ask(consumerSupervisor, Props(classOf[Consumer], i, boundedBuffer, scheduler)).mapTo[ActorRef].map { _ ! Consume }
   }
+
+  Runtime.getRuntime.addShutdownHook(new Thread {
+    override def run() {
+      println("Shutting down....")
+      implicit val inbox = Inbox.create(system) // Create an "actor-in-a-box"
+
+      producerSupervisor ! PoisonPill
+      consumerSupervisor ! PoisonPill
+      boundedBuffer ! PoisonPill
+      println("Bye.")
+    }
+  })
 }
