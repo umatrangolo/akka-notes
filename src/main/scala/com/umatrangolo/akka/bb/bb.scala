@@ -286,8 +286,6 @@ object BB extends App {
   val capacity = 2
   println(s"Starting Bounded Buffer (producers: $producers, consumers: $consumers, capacity: $capacity)")
 
-  val config = ConfigFactory.load()
-
   val system = ActorSystem("bounded-buffer") // Create the 'bounded-buffer' system
   val scheduler = system.scheduler
   println(system.dispatchers.lookup("akka.actor.pinned-dispatcher"))
