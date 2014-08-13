@@ -1,4 +1,4 @@
-package com.umatrangolo.akka.bb
+package com.umatrangolo.akka.masterworkers
 
 import akka.actor.OneForOneStrategy
 import akka.actor.SupervisorStrategy._

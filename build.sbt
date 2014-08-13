@@ -1,4 +1,4 @@
-name := """bounded-buffer-akka"""
+name := """akka-notes"""
 
 version := "1.0"
 

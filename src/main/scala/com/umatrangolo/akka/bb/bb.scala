@@ -280,7 +280,7 @@ object Utils {
   }
 }
 
-object BB extends App {
+object BoundedBufferApp extends App {
   val producers = 3
   val consumers = 2
   val capacity = 2
